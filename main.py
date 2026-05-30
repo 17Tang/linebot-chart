@@ -116,10 +116,12 @@ def handle_message(event):
             
             # 1. 畫圖
             image_path = create_stock_chart(stock_code)
+            print(f"DEBUG 🔍 畫圖結果 (image_path): {image_path}") # <-- 加這行
             
             if image_path and os.path.exists(image_path):
                 # 2. 上傳圖床
                 img_url = upload_to_uploadcc(image_path)
+                print(f"DEBUG 🔍 圖網址 (img_url): {img_url}") # <-- 加這行
                 
                 # 3. 刪除暫存圖
                 if os.path.exists(image_path):
