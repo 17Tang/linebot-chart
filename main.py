@@ -67,6 +67,11 @@ def upload_to_uploadcc(image_path):
         print(f"Upload.cc 上傳失敗: {e}")
         return None
 
+# 新增這段程式碼，用來應付 Render 的健康檢查
+@app.get("/")
+def read_root():
+    return {"status": "LINE Bot is running!"}
+
 # 功能 C：LINE Webhook 接收通道
 @app.post("/callback")
 async def callback(request: Request):
