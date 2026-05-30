@@ -51,70 +51,78 @@ def create_stock_chart(stock_id):
     ticker_id = f"{stock_id}.TW"
     plt.rcParams['axes.unicode_minus'] = False
     
+    # 💡 修正 1：直接透過 Ticker 抓取最權威的歷史資料，確保昨收（previousClose）100% 乾淨無誤差
     try:
-        # 💡 核心修正：加入 auto_adjust=False，強制抓取最真實的市面成交價，拒絕還原股價的誤差
-        stock_data = yf.download(ticker_id, period="5d", interval="1m", auto_adjust=False)
+        ticker = yf.Ticker(ticker_id)
+        # fast_info 裡面的 previous_close 是台灣券商通用的昨日真實收盤價
+        yesterday_close = ticker.fast_info.get('previous_close')
+        if yesterday_close is None or np.isnan(yesterday_close):
+            # 備用方案：如果 fast_info 抓不到，抓歷史日線的最後一筆
+            hist_day = ticker.history(period="2d", auto_adjust=False)
+            yesterday_close = hist_day['Close'].iloc[-2]
     except Exception as e:
-        print(f"yfinance 抓取發生異常: {e}")
+        print(f"抓取昨日收盤價失敗，嘗試大盤格式: {e}")
+        # 如果是上櫃股票，切換成 .TWO
+        try:
+            ticker_id = f"{stock_id}.TWO"
+            ticker = yf.Ticker(ticker_id)
+            yesterday_close = ticker.fast_info.get('previous_close')
+            if yesterday_close is None or np.isnan(yesterday_close):
+                hist_day = ticker.history(period="2d", auto_adjust=False)
+                yesterday_close = hist_day['Close'].iloc[-2]
+        except:
+            return None
+
+    yesterday_close = float(yesterday_close)
+
+    # 💡 修正 2：抓取當天的 1 分鐘即時 K 線
+    try:
+        stock_data = yf.download(ticker_id, period="1d", interval="1m", auto_adjust=False)
+    except Exception as e:
+        print(f"yfinance 當天數據抓取發生異常: {e}")
         return None
         
     if stock_data.empty:
-        try:
-            ticker_id_two = f"{stock_id}.TWO"
-            stock_data = yf.download(ticker_id_two, period="5d", interval="1m", auto_adjust=False)
-        except:
-            return None
-        if stock_data.empty:
-            return None
+        return None
 
+    # 💡 修正 3：徹底清洗 yfinance 欄位名稱（防範多重索引或大小寫 Bug）
+    if isinstance(stock_data.columns, pd.MultiIndex):
+        stock_data.columns = stock_data.columns.get_level_values(0)
+    stock_data.columns = [str(col).capitalize() for col in stock_data.columns]
+
+    # 時區轉換與排序
     if stock_data.index.tz is None:
         stock_data.index = stock_data.index.tz_localize('UTC').tz_convert('Asia/Taipei')
     else:
         stock_data.index = stock_data.index.tz_convert('Asia/Taipei')
         
-    latest_date = stock_data.index.date.max()
-    today_data = stock_data[stock_data.index.date == latest_date]
-    today_data = today_data.between_time('09:00', '13:31')
+    today_data = stock_data.between_time('09:00', '13:31').sort_index()
     
     if today_data.empty:
         return None
 
-    # 確保時間序列由早到晚正確排序
-    today_data = today_data.sort_index()
-
-    # 找出歷史數據中的「昨日交易日」
-    previous_days_data = stock_data[stock_data.index.date < latest_date]
-    if not previous_days_data.empty:
-        previous_days_data = previous_days_data.sort_index()
-        # 💡 核心修正：明確抓取 'Close' 欄位，不拿還原的 'Adj Close'
-        yesterday_close = previous_days_data['Close'].iloc[-1]
-        if isinstance(yesterday_close, pd.Series):
-            yesterday_close = yesterday_close.iloc[0]
-    else:
-        yesterday_close = today_data['Open'].iloc[0]
-        if isinstance(yesterday_close, pd.Series):
-            yesterday_close = yesterday_close.iloc[0]
-
-    yesterday_close = float(yesterday_close)
-
-    # 💡 核心修正：明確指定拿真實成交價 'Close' 的數值序列
+    # 提取當天價格序列
     prices = today_data['Close'].values.flatten().tolist()
     times = today_data.index
     
+    # 計算相對於 09:00 的分鐘數
     minutes_from_start = [(t.hour - 9) * 60 + t.minute for t in times]
     
-    # 終極修正：如果最後一筆數據沒到 13:30 (270分鐘)，強行複製最後一筆價格補滿到 270 分鐘
+    # 補點連線：如果數據還沒走到 13:30 (270分鐘)，強制把最後一筆價格拉到收盤邊界
     if len(minutes_from_start) > 0 and minutes_from_start[-1] < 270:
         minutes_from_start.append(270)
         prices.append(prices[-1])
 
+    # 計算當日最高與最低點
     max_price = float(np.max(prices))
     min_price = float(np.min(prices))
     max_idx = np.argmax(prices)
     min_idx = np.argmin(prices)
 
+    # ---- 🎨 開始繪圖 ----
     fig, ax = plt.subplots(figsize=(10, 5))
     
+    # 分段上色（紅/綠）
     for i in range(len(prices) - 1):
         x1, x2 = minutes_from_start[i], minutes_from_start[i+1]
         y1, y2 = prices[i], prices[i+1]
@@ -122,24 +130,30 @@ def create_stock_chart(stock_id):
         color = '#ff3333' if avg_p >= yesterday_close else '#00cc44'
         ax.plot([x1, x2], [y1, y2], color=color, linewidth=2)
     
+    # 畫灰色平盤虛線
     ax.axhline(y=yesterday_close, color='gray', linestyle='--', alpha=0.6)
     
+    # 動態計算數值標籤的上下 Offset 間距
     text_offset = yesterday_close * 0.004
     
+    # 最高點標示 (文字與點的顏色由與昨收的關係決定)
     max_color = '#ff3333' if max_price >= yesterday_close else '#00cc44'
     ax.scatter(minutes_from_start[max_idx], max_price, color=max_color, s=30, zorder=5)
     ax.text(minutes_from_start[max_idx], max_price + text_offset, f"{max_price:.2f}", 
             color=max_color, fontsize=10, weight='bold', ha='center', va='bottom')
             
+    # 最低點標示 (若最低點仍大於昨收，一樣維持紅色)
     min_color = '#ff3333' if min_price >= yesterday_close else '#00cc44'
     ax.scatter(minutes_from_start[min_idx], min_price, color=min_color, s=30, zorder=5)
     ax.text(minutes_from_start[min_idx], min_price - text_offset, f"{min_price:.2f}", 
             color=min_color, fontsize=10, weight='bold', ha='center', va='top')
 
+    # 軸線設定（左右完全不留白）
     ax.set_xlim(0, 270)
     ax.set_xticks([0, 60, 120, 180, 240, 270])
     ax.set_xticklabels(['09:00', '10:00', '11:00', '12:00', '13:00', '13:30'])
     
+    # 嚴格對稱的 Y 軸百分比刻度
     y_ticks = [
         yesterday_close * 0.90,
         yesterday_close * 0.95,
@@ -151,6 +165,7 @@ def create_stock_chart(stock_id):
     ax.set_yticks(y_ticks)
     ax.set_yticklabels([f"{val:.2f}" for val in y_ticks])
     
+    # 純股號標題
     ax.set_title(f"{stock_id}", fontsize=18, weight='bold')
     ax.set_xlabel("Time", fontsize=12)
     ax.set_ylabel("Price", fontsize=12)
@@ -161,7 +176,6 @@ def create_stock_chart(stock_id):
     plt.savefig(image_path, bbox_inches='tight', dpi=150)
     plt.close() 
     return output_filename
-
 # 功能 B：核心篩選器（只辨識 p + 股號）
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
