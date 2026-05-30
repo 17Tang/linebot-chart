@@ -83,7 +83,9 @@ def create_stock_chart(stock_id):
         
     latest_date = stock_data.index.date.max()
     today_data = stock_data[stock_data.index.date == latest_date]
-    today_data = today_data.between_time('09:00', '13:30')
+    
+    # 💡 關鍵修正：放寬到 13:31，確保 13:30 最後一盤收盤數據被包含進來
+    today_data = today_data.between_time('09:00', '13:31')
     
     if today_data.empty:
         print(f"⚠️ 找不到 {latest_date} 當天 09:00-13:30 的交易數據")
@@ -103,11 +105,9 @@ def create_stock_chart(stock_id):
     yesterday_close = float(yesterday_close)
 
     # ---- 🔍 數據整理與最高/最低點計算 ----
-    # 確保價格與時間序列乾淨
     prices = today_data['Close'].values.flatten()
     times = today_data.index
     
-    # 找出當日最高點與最低點
     max_price = float(np.max(prices))
     min_price = float(np.min(prices))
     max_idx = np.argmax(prices)
@@ -116,48 +116,60 @@ def create_stock_chart(stock_id):
     # ---- 🎨 開始繪製專業江波圖 ----
     fig, ax = plt.subplots(figsize=(10, 5))
     
-    # 將時間轉為分鐘數，方便精準控制 X 軸左右邊界不留白
     # 09:00 是基準點 (0分鐘)，13:30 是 270 分鐘
     minutes_from_start = [(t.hour - 9) * 60 + t.minute for t in times]
     
-    # 逐段畫線：大於昨收用紅線(台股習慣)，小於用綠線
+    # 逐段畫線：大於昨收用紅線，小於昨收用綠線
     for i in range(len(prices) - 1):
         x1, x2 = minutes_from_start[i], minutes_from_start[i+1]
         y1, y2 = prices[i], prices[i+1]
         
-        # 決定線段顏色（以該段的平均價或終點價與昨收比較）
         avg_p = (y1 + y2) / 2
         color = '#ff3333' if avg_p >= yesterday_close else '#00cc44'
         
         ax.plot([x1, x2], [y1, y2], color=color, linewidth=2)
     
-    # 畫一條灰色的水平虛線代表昨日收盤價（平盤線），且不加標籤(不顯示圖例)
+    # 畫一條灰色的水平虛線代表昨日收盤價（平盤線）
     ax.axhline(y=yesterday_close, color='gray', linestyle='--', alpha=0.6)
     
-    # 標示最高點與最低點數值 (文字微調避免擋到線)
-    ax.scatter(minutes_from_start[max_idx], max_price, color='#ff3333', s=40, zorder=5)
-    ax.text(minutes_from_start[max_idx], max_price + (yesterday_close*0.002), f"▲ {max_price:.2f}", 
-            color='#ff3333', fontsize=10, weight='bold', ha='center')
+    # 計算文字上下 offset 的安全間距（以昨收的 0.4% 為基準）
+    text_offset = yesterday_close * 0.004
+    
+    # 💡 修正高低點邏輯：
+    # 1. 最高點標示 (不帶有符號，文字顏色依據價格本身與昨收的關係決定)
+    max_color = '#ff3333' if max_price >= yesterday_close else '#00cc44'
+    ax.scatter(minutes_from_start[max_idx], max_price, color=max_color, s=30, zorder=5)
+    ax.text(minutes_from_start[max_idx], max_price + text_offset, f"{max_price:.2f}", 
+            color=max_color, fontsize=10, weight='bold', ha='center', va='bottom')
             
-    ax.scatter(minutes_from_start[min_idx], min_price, color='#00cc44', s=40, zorder=5)
-    ax.text(minutes_from_start[min_idx], min_price - (yesterday_close*0.004), f"▼ {min_price:.2f}", 
-            color='#00cc44', fontsize=10, weight='bold', ha='center')
+    # 2. 最低點標示 (不帶有符號，若最低點仍大於昨收，一樣使用紅色)
+    min_color = '#ff3333' if min_price >= yesterday_close else '#00cc44'
+    ax.scatter(minutes_from_start[min_idx], min_price, color=min_color, s=30, zorder=5)
+    ax.text(minutes_from_start[min_idx], min_price - text_offset, f"{min_price:.2f}", 
+            color=min_color, fontsize=10, weight='bold', ha='center', va='top')
 
     # ---- 📐 軸線範圍與刻度調整 ----
-    # 嚴格控制 X 軸起終點：0 到 270 分鐘，達成前後完全不留白
+    # 嚴格控制 X 軸左右不留白
     ax.set_xlim(0, 270)
-    
-    # 設定 X 軸刻度位置與文字（隱藏台北字樣，只顯示時間）
     ax.set_xticks([0, 60, 120, 180, 240, 270])
     ax.set_xticklabels(['09:00', '10:00', '11:00', '12:00', '13:00', '13:30'])
     
-    # Y 軸中心對齊昨日收盤價，上下振幅嚴格鎖定 10%
-    y_min = yesterday_close * 0.90
-    y_max = yesterday_close * 1.10
-    ax.set_ylim(y_min, y_max)
+    # 💡 修正 Y 軸刻度：以昨收為出發點，精準設定 ±5% 與 ±10% 的刻度數值
+    y_ticks = [
+        yesterday_close * 0.90,  # -10%
+        yesterday_close * 0.95,  # -5%
+        yesterday_close,         # 昨收平盤線
+        yesterday_close * 1.05,  # +5%
+        yesterday_close * 1.10   # +10%
+    ]
+    ax.set_ylim(yesterday_close * 0.90, yesterday_close * 1.10)
+    ax.set_yticks(y_ticks)
     
-    # 圖表標題與基本設定
-    ax.set_title(f"Stock {stock_id} - Intraday Trend ({latest_date})", fontsize=16)
+    # 格式化 Y 軸文字：顯示兩位小數
+    ax.set_yticklabels([f"{val:.2f}" for val in y_ticks])
+    
+    # 💡 修正標題：只單純顯示股號
+    ax.set_title(f"{stock_id}", fontsize=18, weight='bold')
     ax.set_xlabel("Time", fontsize=12)
     ax.set_ylabel("Price", fontsize=12)
     ax.grid(True, linestyle='--', alpha=0.3)
