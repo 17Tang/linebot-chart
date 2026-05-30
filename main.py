@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import pandas as pd
 import datetime
 import yfinance as yf
@@ -55,10 +56,10 @@ async def callback(request: Request):
 def create_stock_chart(stock_id):
     ticker_id = f"{stock_id}.TW"
     
-    # 修正 matplotlib 在某些環境下負號顯示為方塊的問題
+    # 修正 matplotlib 負號顯示問題
     plt.rcParams['axes.unicode_minus'] = False
     
-    # 抓取最近 5 天的 1 分鐘 K 線數據，確保能完整拿到「昨天收盤價」與「今天即時數據」
+    # 抓取最近 5 天的 1 分鐘 K 線數據
     try:
         stock_data = yf.download(ticker_id, period="5d", interval="1m")
     except Exception as e:
@@ -75,19 +76,13 @@ def create_stock_chart(stock_id):
             return None
 
     # ---- ⏱️ 時區處理與當天數據篩選 ----
-    # 1. 將索引轉換為台灣時區 (Asia/Taipei)
     if stock_data.index.tz is None:
         stock_data.index = stock_data.index.tz_localize('UTC').tz_convert('Asia/Taipei')
     else:
         stock_data.index = stock_data.index.tz_convert('Asia/Taipei')
         
-    # 2. 找出數據中最新的一天（即今天或最近一個交易日）
     latest_date = stock_data.index.date.max()
-    
-    # 3. 篩選出屬於最新那一天的數據
     today_data = stock_data[stock_data.index.date == latest_date]
-    
-    # 4. 嚴格篩選台股交易時間：09:00 到 13:30
     today_data = today_data.between_time('09:00', '13:30')
     
     if today_data.empty:
@@ -95,47 +90,77 @@ def create_stock_chart(stock_id):
         return None
 
     # ---- 📈 尋找昨日收盤價 (平盤價) ----
-    # 找出除了最新一天之外，前一個交易日的最後一筆收盤價
     previous_days_data = stock_data[stock_data.index.date < latest_date]
     if not previous_days_data.empty:
-        # 拿到昨天的最後一筆收盤價
         yesterday_close = previous_days_data['Close'].iloc[-1]
-        # 如果 yfinance 回傳的是 Series 則取數值
         if isinstance(yesterday_close, pd.Series):
             yesterday_close = yesterday_close.iloc[0]
     else:
-        # 如果完全沒拿到歷史數據，勉強用當天開盤價當替代（通常 period=5d 一定拿得到昨收）
         yesterday_close = today_data['Open'].iloc[0]
         if isinstance(yesterday_close, pd.Series):
             yesterday_close = yesterday_close.iloc[0]
 
-    # 確保數值為純數字
     yesterday_close = float(yesterday_close)
 
-    # ---- 🎨 開始繪製單日走勢圖 ----
-    plt.figure(figsize=(10, 5))
+    # ---- 🔍 數據整理與最高/最低點計算 ----
+    # 確保價格與時間序列乾淨
+    prices = today_data['Close'].values.flatten()
+    times = today_data.index
     
-    # 畫出當天走勢線
-    plt.plot(today_data.index.strftime('%H:%M'), today_data['Close'], label='Price', color='#1f77b4', linewidth=2)
+    # 找出當日最高點與最低點
+    max_price = float(np.max(prices))
+    min_price = float(np.min(prices))
+    max_idx = np.argmax(prices)
+    min_idx = np.argmin(prices)
+
+    # ---- 🎨 開始繪製專業江波圖 ----
+    fig, ax = plt.subplots(figsize=(10, 5))
     
-    # 畫一條紅色的水平虛線代表昨日收盤價（平盤線）
-    plt.axhline(y=yesterday_close, color='red', linestyle='--', alpha=0.6, label=f'Ref ({yesterday_close:.2f})')
+    # 將時間轉為分鐘數，方便精準控制 X 軸左右邊界不留白
+    # 09:00 是基準點 (0分鐘)，13:30 是 270 分鐘
+    minutes_from_start = [(t.hour - 9) * 60 + t.minute for t in times]
     
-    # 計算上下振幅 10% 的 Y 軸限制
+    # 逐段畫線：大於昨收用紅線(台股習慣)，小於用綠線
+    for i in range(len(prices) - 1):
+        x1, x2 = minutes_from_start[i], minutes_from_start[i+1]
+        y1, y2 = prices[i], prices[i+1]
+        
+        # 決定線段顏色（以該段的平均價或終點價與昨收比較）
+        avg_p = (y1 + y2) / 2
+        color = '#ff3333' if avg_p >= yesterday_close else '#00cc44'
+        
+        ax.plot([x1, x2], [y1, y2], color=color, linewidth=2)
+    
+    # 畫一條灰色的水平虛線代表昨日收盤價（平盤線），且不加標籤(不顯示圖例)
+    ax.axhline(y=yesterday_close, color='gray', linestyle='--', alpha=0.6)
+    
+    # 標示最高點與最低點數值 (文字微調避免擋到線)
+    ax.scatter(minutes_from_start[max_idx], max_price, color='#ff3333', s=40, zorder=5)
+    ax.text(minutes_from_start[max_idx], max_price + (yesterday_close*0.002), f"▲ {max_price:.2f}", 
+            color='#ff3333', fontsize=10, weight='bold', ha='center')
+            
+    ax.scatter(minutes_from_start[min_idx], min_price, color='#00cc44', s=40, zorder=5)
+    ax.text(minutes_from_start[min_idx], min_price - (yesterday_close*0.004), f"▼ {min_price:.2f}", 
+            color='#00cc44', fontsize=10, weight='bold', ha='center')
+
+    # ---- 📐 軸線範圍與刻度調整 ----
+    # 嚴格控制 X 軸起終點：0 到 270 分鐘，達成前後完全不留白
+    ax.set_xlim(0, 270)
+    
+    # 設定 X 軸刻度位置與文字（隱藏台北字樣，只顯示時間）
+    ax.set_xticks([0, 60, 120, 180, 240, 270])
+    ax.set_xticklabels(['09:00', '10:00', '11:00', '12:00', '13:00', '13:30'])
+    
+    # Y 軸中心對齊昨日收盤價，上下振幅嚴格鎖定 10%
     y_min = yesterday_close * 0.90
     y_max = yesterday_close * 1.10
-    plt.ylim(y_min, y_max)
+    ax.set_ylim(y_min, y_max)
     
-    # 限制 X 軸刻度數量，避免時間標籤太擠（例如每 30 分鐘顯示一次）
-    x_ticks = plt.gca().get_xticks()
-    if len(x_ticks) > 10:
-        plt.gca().set_xticks(x_ticks[::15]) # 依數據密集度適度跳格顯示
-        
-    plt.title(f"Stock {stock_id} - Day Trend ({latest_date})", fontsize=16)
-    plt.xlabel("Time (Taipei)", fontsize=12)
-    plt.ylabel("Price", fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.3)
-    plt.legend(loc='upper left')
+    # 圖表標題與基本設定
+    ax.set_title(f"Stock {stock_id} - Intraday Trend ({latest_date})", fontsize=16)
+    ax.set_xlabel("Time", fontsize=12)
+    ax.set_ylabel("Price", fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.3)
     
     # 儲存到自建的 static 資料夾
     output_filename = f"{stock_id}_chart.png"
@@ -144,6 +169,7 @@ def create_stock_chart(stock_id):
     plt.savefig(image_path, bbox_inches='tight', dpi=150)
     plt.close() 
     return output_filename
+
 # 功能 B：處理 LINE 訊息的核心邏輯
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
