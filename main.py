@@ -16,7 +16,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 app = FastAPI()
 
-# 📁 建立一個給外網存取圖片的 static 資料夾
+# 📁 1. 建立一個給外網存取圖片的 static 資料夾
 STATIC_DIR = "static"
 if not os.path.exists(STATIC_DIR):
     os.makedirs(STATIC_DIR)
@@ -24,25 +24,38 @@ if not os.path.exists(STATIC_DIR):
 # 讓 FastAPI 掛載這個資料夾，外網輸入 /static/檔名 就能看到圖
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# 🔒 從環境變數讀取憑證
+# 🔒 2. 直接從系統環境（Render 後台設定）讀取憑證
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
-# 你的 Render 服務網址（例如 https://linebot-chart.onrender.com）
-# 程式會自動去抓，如果抓不到請確保 Render 運作正常
+# 你的 Render 服務網址
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://linebot-chart.onrender.com")
 
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
+# 應付 Render 的健康檢查 (支援 GET 與 HEAD)
 @app.get("/")
 @app.head("/")
 def read_root():
     return {"status": "LINE Bot is running!"}
 
-# 功能 A：抓數據並畫走勢圖（改存到 static 資料夾）
+# 🛠️ 3. Webhook 接收通道（修正：把原本漏掉的這段補回來了！）
+@app.post("/callback")
+async def callback(request: Request):
+    signature = request.headers.get('X-Line-Signature')
+    body = await request.body()
+    try:
+        handler.handle(body.decode('utf-8'), signature)
+    except InvalidSignatureError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    return 'OK'
+
+# 功能 A：抓數據並畫走勢圖（存到內建 static 資料夾，徹底解決第三方圖床擋 IP 問題）
 def create_stock_chart(stock_id):
     ticker_id = f"{stock_id}.TW"
+    
+    # 修正：用具體日期範圍，徹底避開 period="5d" 的 yfinance 解析 Bug
     today = datetime.date.today()
     start_date = today - datetime.timedelta(days=7)
     
@@ -57,6 +70,7 @@ def create_stock_chart(stock_id):
         print(f"yfinance 抓取發生異常: {e}")
         return None
     
+    # 支援上櫃股票處理
     if stock_data.empty:
         try:
             ticker_id_two = f"{stock_id}.TWO"
@@ -79,15 +93,15 @@ def create_stock_chart(stock_id):
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.legend()
     
-    # 💥 重點：直接存進 static 資料夾
+    # 直接存進自建的 static 資料夾
     output_filename = f"{stock_id}_chart.png"
     image_path = os.path.join(STATIC_DIR, output_filename)
     
     plt.savefig(image_path, bbox_inches='tight', dpi=150)
     plt.close() 
-    return output_filename # 只回傳檔名
+    return output_filename
 
-# 處理 LINE 訊息的核心邏輯
+# 功能 B：處理 LINE 訊息的核心邏輯
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_msg = event.message.text.strip()
@@ -103,8 +117,8 @@ def handle_message(event):
             print(f"DEBUG 🔍 畫圖結果 (filename): {filename}")
             
             if filename:
-                # 2. 💥 重點：直接用你自己的 Render 網址組出圖片連結！
-                # 加上時間戳 ?t=... 是為了防止 LINE 伺服器快取舊圖，確保每次都是最新的
+                # 2. 組合出你自己的 Render 靜態網址
+                # 加上時間戳 (?t=...) 用來防止 LINE 快取舊圖
                 timestamp = int(datetime.datetime.now().timestamp())
                 img_url = f"{RENDER_EXTERNAL_URL}/static/{filename}?t={timestamp}"
                 print(f"DEBUG 🔍 自建圖床網址 (img_url): {img_url}")
