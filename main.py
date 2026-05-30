@@ -1,5 +1,6 @@
 import os
 import requests
+import datetime
 import yfinance as yf
 import matplotlib.pyplot as plt
 from fastapi import FastAPI, Request, HTTPException
@@ -27,13 +28,41 @@ handler = WebhookHandler(LINE_SECRET)
 # 功能 A：抓數據並畫走勢圖
 def create_stock_chart(stock_id):
     ticker_id = f"{stock_id}.TW"
-    # 抓取最近 5 天的 15 分鐘 K 線數據
-    stock_data = yf.download(ticker_id, period="5d", interval="15m")
+    
+    # 修正方案：不用 period，改用 start/end 指定最近幾天的日期
+    # 抓取從 7 天前到今天的數據，這樣開盤日一定能包含進去
+    today = datetime.date.today()
+    start_date = today - datetime.timedelta(days=7)
+    
+    try:
+        # 使用 start 和 end 參數，並搭配 15 分鐘 K 線
+        stock_data = yf.download(
+            ticker_id, 
+            start=start_date.strftime('%Y-%m-%d'), 
+            end=today.strftime('%Y-%m-%d'), 
+            interval="15m"
+        )
+    except Exception as e:
+        print(f"yfinance 抓取發生異常: {e}")
+        return None
     
     if stock_data.empty:
-        return None
+        # 如果有些股票是上櫃（.TWO），上市找不到的話就嘗試抓上櫃
+        try:
+            ticker_id_two = f"{stock_id}.TWO"
+            stock_data = yf.download(
+                ticker_id_two, 
+                start=start_date.strftime('%Y-%m-%d'), 
+                end=today.strftime('%Y-%m-%d'), 
+                interval="15m"
+            )
+        except:
+            return None
+            
+        if stock_data.empty:
+            return None
         
-    # 繪製精美走勢圖
+    # 開始繪製圖表
     plt.figure(figsize=(10, 5))
     plt.plot(stock_data['Close'], label='Close Price', color='#1f77b4', linewidth=2)
     plt.title(f"Stock {stock_id} - Recent Trend", fontsize=16)
@@ -42,12 +71,10 @@ def create_stock_chart(stock_id):
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.legend()
     
-    # 儲存到本地伺服器暫存
     output_filename = f"{stock_id}_chart.png"
     plt.savefig(output_filename, bbox_inches='tight', dpi=150)
     plt.close() 
     return output_filename
-
 # 功能 B：上傳到 Upload.cc 圖床 (免 Key、台灣可用)
 def upload_to_uploadcc(image_path):
     url = "https://upload.cc/image_upload"
