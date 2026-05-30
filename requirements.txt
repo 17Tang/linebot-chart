@@ -1,6 +1,8 @@
-line-bot-sdk
 fastapi
 uvicorn
+line-bot-sdk
 yfinance
+pandas
+numpy
 matplotlib
 requests
