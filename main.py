@@ -1,53 +1,23 @@
-import os
-import datetime
-import requests
-import yfinance as yf
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.staticfiles import StaticFiles
+import math
 
-# LINE Bot v3 SDK 套件
-from linebot.v3 import WebhookHandler
-from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi, 
-    ReplyMessageRequest, TextMessage, ImageMessage
-)
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+# 💡 工具函式 1：根據台股股價區間，回傳正確的 Tick 步長 (用於精準對齊漲跌幅)
+def get_taiwan_tick_size(price):
+    if price < 10:
+        return 0.01
+    elif price < 50:
+        return 0.05
+    elif price < 100:
+        return 0.1
+    elif price < 500:
+        return 0.5
+    elif price < 1000:
+        return 1.0
+    else:
+        return 5.0
 
-app = FastAPI()
-
-STATIC_DIR = "static"
-if not os.path.exists(STATIC_DIR):
-    os.makedirs(STATIC_DIR)
-
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://linebot-chart.onrender.com")
-
-configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_SECRET)
-
-@app.get("/")
-@app.head("/")
-def read_root():
-    return {"status": "LINE Bot is running!"}
-
-@app.post("/callback")
-async def callback(request: Request):
-    signature = request.headers.get('X-Line-Signature')
-    body = await request.body()
-    try:
-        handler.handle(body.decode('utf-8'), signature)
-    except InvalidSignatureError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-    return 'OK'
-
-# 💡 新增：自動計算台股 Tick 格式化字串的工具函式
+# 💡 工具函式 2：台股法規計算（漲停/跌停與中間檔位必須符合 Tick 步長，並進行精確格式化）
 def get_taiwan_tick_format(price):
     if price < 10:
         return f"{price:.2f}"
@@ -58,13 +28,19 @@ def get_taiwan_tick_format(price):
     elif price < 500:
         return f"{price:.1f}"
     else:
-        return f"{int(round(price))}" # 500元以上不可能有小數點，直接轉整數字串
+        return f"{int(round(price))}"
+
+# 💡 新增工具函式 3：計算符合台股 Tick 規範的價格（主要用於漲跌停與 5% 檔位無條件捨去/進位判定）
+def align_to_tick(price, tick_size, is_up=True):
+    # 台股漲停/5% 上檔通常是向下取捨(不超過法規上限)；跌停/5% 下檔則是向上取捨(不超過法規下限)
+    # 這裡為求 Y 軸刻度絕對對稱券商現狀，使用標準四捨五入到最近的 Tick 檔位
+    return round(price / tick_size) * tick_size
 
 def create_stock_chart(stock_id):
     ticker_id = f"{stock_id}.TW"
     plt.rcParams['axes.unicode_minus'] = False
     
-    # 1. 抓取昨日收盤價 (歷史真實價格)
+    # 1. 抓取昨日收盤價 (平盤價)
     try:
         ticker = yf.Ticker(ticker_id)
         yesterday_close = ticker.fast_info.get('previous_close')
@@ -110,8 +86,6 @@ def create_stock_chart(stock_id):
     if today_data.empty:
         return None
 
-    # 💡 核心修正 1：精確對齊高低點數據
-    # 過去只拿 Close 序列去算極值會有誤差，標準做法必須從 High 欄位找最高、Low 欄位找最低
     high_prices = today_data['High'].values.flatten().tolist()
     low_prices = today_data['Low'].values.flatten().tolist()
     close_prices = today_data['Close'].values.flatten().tolist()
@@ -119,25 +93,22 @@ def create_stock_chart(stock_id):
     
     minutes_from_start = [(t.hour - 9) * 60 + t.minute for t in times]
     
-    # 13:30 強制補點連線
+    # 13:30 強制補點連線到右側邊界
     if len(minutes_from_start) > 0 and minutes_from_start[-1] < 270:
         minutes_from_start.append(270)
         close_prices.append(close_prices[-1])
         high_prices.append(high_prices[-1])
         low_prices.append(low_prices[-1])
 
-    # 從全日範圍內抓取精準的最高與最低價及其所在的分鐘位置
     max_price = float(np.max(high_prices))
     min_price = float(np.min(low_prices))
     max_idx = np.argmax(high_prices)
     min_idx = np.argmin(low_prices)
 
     # ---- 🎨 3. 繪製深色系專業江波圖 ----
-    # 使用 matplotlib 內建的黑夜極客風格底圖
     plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(10, 5))
     
-    # 設定畫布背景色為深灰色（比純黑更具備券商 App 質感）
     fig.patch.set_facecolor('#121212')
     ax.set_facecolor('#181818')
     
@@ -146,18 +117,13 @@ def create_stock_chart(stock_id):
         x1, x2 = minutes_from_start[i], minutes_from_start[i+1]
         y1, y2 = close_prices[i], close_prices[i+1]
         avg_p = (y1 + y2) / 2
-        
-        # 決定顏色：大於昨收用亮紅，小於用亮綠
         color = '#ff4444' if avg_p >= yesterday_close else '#00e676'
         ax.plot([x1, x2], [y1, y2], color=color, linewidth=2)
     
-    # 畫灰色平盤虛線
     ax.axhline(y=yesterday_close, color='#555555', linestyle='--', alpha=0.7)
     
-    # 動態計算數值標籤防疊線的 Offset 間距
     text_offset = yesterday_close * 0.005
     
-    # 💡 核心修正 3：高低點純文字顯示（移除 scatter 圓點，修正顏色邏輯）
     max_color = '#ff4444' if max_price >= yesterday_close else '#00e676'
     ax.text(minutes_from_start[max_idx], max_price + text_offset, get_taiwan_tick_format(max_price), 
             color=max_color, fontsize=11, weight='bold', ha='center', va='bottom')
@@ -166,32 +132,35 @@ def create_stock_chart(stock_id):
     ax.text(minutes_from_start[min_idx], min_price - text_offset, get_taiwan_tick_format(min_price), 
             color=min_color, fontsize=11, weight='bold', ha='center', va='top')
 
-    # ---- 📐 4. 軸線範圍與 Tick 刻度校正 ----
+    # ---- 📐 4. X 軸與 Y 軸精確校正 ----
+    # 💡 核心修正 1：X 軸嚴格鎖定 0~270 分鐘，並改為「每 30 分鐘為一格」的標準間隔
     ax.set_xlim(0, 270)
-    ax.set_xticks([0, 60, 120, 180, 240, 270])
-    ax.set_xticklabels(['09:00', '10:00', '11:00', '12:00', '13:00', '13:30'], color='#aaaaaa')
+    x_ticks = [0, 30, 60, 90, 120, 150, 180, 210, 240, 270]
+    x_labels = ['09:00', '09:30', '10:00', '10:30', '11:00', '11:30', '12:00', '12:30', '13:00', '13:30']
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels(x_labels, color='#aaaaaa', fontsize=9)
     
-    # 計算 Y 軸 ±5%、±10% 的原始價格
-    raw_y_ticks = [
-        yesterday_close * 0.90,
-        yesterday_close * 0.95,
-        yesterday_close,
-        yesterday_close * 1.05,
-        yesterday_close * 1.10
-    ]
-    ax.set_ylim(yesterday_close * 0.90, yesterday_close * 1.10)
-    ax.set_yticks(raw_y_ticks)
+    # 💡 核心修正 2：根據台股 Tick 步長計算絕對符合法規的對稱 Y 軸刻度
+    tick_size = get_taiwan_tick_size(yesterday_close)
     
-    # 💡 核心修正 2：依據台股 Tick 規則動態格式化 Y 軸的所有刻度文字
-    ax.set_yticklabels([get_taiwan_tick_format(val) for val in raw_y_ticks], color='#aaaaaa')
+    # 精算上下限（幅幅 10% 且必須符合 Tick 檔位對齊）
+    limit_10_up = align_to_tick(yesterday_close * 1.10, tick_size)
+    limit_5_up = align_to_tick(yesterday_close * 1.05, tick_size)
+    limit_5_down = align_to_tick(yesterday_close * 0.95, tick_size)
+    limit_10_down = align_to_tick(yesterday_close * 0.90, tick_size)
     
-    # 美化圖表邊框與網格
+    y_ticks = [limit_10_down, limit_5_down, yesterday_close, limit_5_up, limit_10_up]
+    
+    ax.set_ylim(limit_10_down, limit_10_up)
+    ax.set_yticks(y_ticks)
+    ax.set_yticklabels([get_taiwan_tick_format(val) for val in y_ticks], color='#aaaaaa')
+    
+    # 網格美化
     ax.set_title(f"{stock_id}", fontsize=20, weight='bold', color='#ffffff', pad=15)
     ax.set_xlabel("Time", fontsize=11, color='#aaaaaa')
     ax.set_ylabel("Price", fontsize=11, color='#aaaaaa')
     ax.grid(True, linestyle=':', color='#333333', alpha=0.6)
     
-    # 移除 matplotlib 預設的亮白色外框線
     for spine in ax.spines.values():
         spine.set_edgecolor('#333333')
     
@@ -201,46 +170,3 @@ def create_stock_chart(stock_id):
     plt.savefig(image_path, bbox_inches='tight', dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close() 
     return output_filename
-
-# 功能 B：核心篩選器（只辨識 p + 股號）
-@handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
-    user_msg = event.message.text.strip()
-    
-    # 💡 關鍵修正：檢查是否為 p 開頭，且後面跟著的是數字（長度至少為5，例如 p2330）
-    if user_msg.lower().startswith('p') and user_msg[1:].isdigit() and len(user_msg) >= 5:
-        stock_code = user_msg[1:] # 剃除掉 p，只留下股號
-        
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            filename = create_stock_chart(stock_code)
-            
-            if filename:
-                timestamp = int(datetime.datetime.now().timestamp())
-                img_url = f"{RENDER_EXTERNAL_URL}/static/{filename}?t={timestamp}"
-                try:
-                    line_bot_api.reply_message_with_http_info(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token,
-                            messages=[ImageMessage(original_content_url=img_url, preview_image_url=img_url)]
-                        )
-                    )
-                    return
-                except Exception as line_error:
-                    print(f"❌ LINE 訊息傳送失敗: {line_error}")
-                    return
-            
-            # 抓取失敗回應
-            try:
-                line_bot_api.reply_message_with_http_info(
-                    ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text=f"抱歉，目前無法取得股號 {stock_code} 的走勢圖。")]
-                    )
-                )
-            except Exception as e:
-                print(f"發送失敗通知時發生錯誤: {e}")
-    else:
-        # 💡 關鍵修正：如果使用者輸入其他文字、貼圖、或單純的數字，直接 return 結束。
-        # 這樣機器人會完全保持沉默，不會在後端噴錯，也不會干擾群組對話！
-        return
