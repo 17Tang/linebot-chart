@@ -47,13 +47,13 @@ async def callback(request: Request):
         raise HTTPException(status_code=400, detail="Invalid signature")
     return 'OK'
 
-# 功能 A：專業江波圖繪製（含 13:30 強制補點）
 def create_stock_chart(stock_id):
     ticker_id = f"{stock_id}.TW"
     plt.rcParams['axes.unicode_minus'] = False
     
     try:
-        stock_data = yf.download(ticker_id, period="5d", interval="1m")
+        # 💡 核心修正：加入 auto_adjust=False，強制抓取最真實的市面成交價，拒絕還原股價的誤差
+        stock_data = yf.download(ticker_id, period="5d", interval="1m", auto_adjust=False)
     except Exception as e:
         print(f"yfinance 抓取發生異常: {e}")
         return None
@@ -61,7 +61,7 @@ def create_stock_chart(stock_id):
     if stock_data.empty:
         try:
             ticker_id_two = f"{stock_id}.TWO"
-            stock_data = yf.download(ticker_id_two, period="5d", interval="1m")
+            stock_data = yf.download(ticker_id_two, period="5d", interval="1m", auto_adjust=False)
         except:
             return None
         if stock_data.empty:
@@ -79,8 +79,14 @@ def create_stock_chart(stock_id):
     if today_data.empty:
         return None
 
+    # 確保時間序列由早到晚正確排序
+    today_data = today_data.sort_index()
+
+    # 找出歷史數據中的「昨日交易日」
     previous_days_data = stock_data[stock_data.index.date < latest_date]
     if not previous_days_data.empty:
+        previous_days_data = previous_days_data.sort_index()
+        # 💡 核心修正：明確抓取 'Close' 欄位，不拿還原的 'Adj Close'
         yesterday_close = previous_days_data['Close'].iloc[-1]
         if isinstance(yesterday_close, pd.Series):
             yesterday_close = yesterday_close.iloc[0]
@@ -91,12 +97,13 @@ def create_stock_chart(stock_id):
 
     yesterday_close = float(yesterday_close)
 
+    # 💡 核心修正：明確指定拿真實成交價 'Close' 的數值序列
     prices = today_data['Close'].values.flatten().tolist()
     times = today_data.index
     
     minutes_from_start = [(t.hour - 9) * 60 + t.minute for t in times]
     
-    # 💡 終極修正：如果最後一筆數據沒到 13:30 (270分鐘)，強行複製最後一筆價格補滿到 270 分鐘
+    # 終極修正：如果最後一筆數據沒到 13:30 (270分鐘)，強行複製最後一筆價格補滿到 270 分鐘
     if len(minutes_from_start) > 0 and minutes_from_start[-1] < 270:
         minutes_from_start.append(270)
         prices.append(prices[-1])
