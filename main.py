@@ -1,6 +1,6 @@
 import os
-import requests
 import datetime
+import requests
 import yfinance as yf
 import matplotlib.pyplot as plt
 from fastapi import FastAPI, Request, HTTPException
@@ -20,22 +20,22 @@ app = FastAPI()
 LINE_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
-# 初始化 LINE Bot 配置
-# 注意：在本地測試時如果沒設定環境變數會報錯，部署到 Render 就正常了
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
+
+# 應付 Render 的健康檢查 (支援 GET 與 HEAD)
+@app.get("/")
+@app.head("/")
+def read_root():
+    return {"status": "LINE Bot is running!"}
 
 # 功能 A：抓數據並畫走勢圖
 def create_stock_chart(stock_id):
     ticker_id = f"{stock_id}.TW"
-    
-    # 修正方案：不用 period，改用 start/end 指定最近幾天的日期
-    # 抓取從 7 天前到今天的數據，這樣開盤日一定能包含進去
     today = datetime.date.today()
     start_date = today - datetime.timedelta(days=7)
     
     try:
-        # 使用 start 和 end 參數，並搭配 15 分鐘 K 線
         stock_data = yf.download(
             ticker_id, 
             start=start_date.strftime('%Y-%m-%d'), 
@@ -47,7 +47,6 @@ def create_stock_chart(stock_id):
         return None
     
     if stock_data.empty:
-        # 如果有些股票是上櫃（.TWO），上市找不到的話就嘗試抓上櫃
         try:
             ticker_id_two = f"{stock_id}.TWO"
             stock_data = yf.download(
@@ -62,7 +61,6 @@ def create_stock_chart(stock_id):
         if stock_data.empty:
             return None
         
-    # 開始繪製圖表
     plt.figure(figsize=(10, 5))
     plt.plot(stock_data['Close'], label='Close Price', color='#1f77b4', linewidth=2)
     plt.title(f"Stock {stock_id} - Recent Trend", fontsize=16)
@@ -75,7 +73,8 @@ def create_stock_chart(stock_id):
     plt.savefig(output_filename, bbox_inches='tight', dpi=150)
     plt.close() 
     return output_filename
-# 功能 B：上傳到 Upload.cc 圖床 (免 Key、台灣可用)
+
+# 功能 B：上傳到 Upload.cc 圖床
 def upload_to_uploadcc(image_path):
     url = "https://upload.cc/image_upload"
     try:
@@ -85,19 +84,13 @@ def upload_to_uploadcc(image_path):
             
         if response.status_code == 200:
             res_json = response.json()
-            # 檢查是否上傳成功並取得檔名
             if res_json.get('success_image') and len(res_json['success_image']) > 0:
                 img_name = res_json['success_image'][0]['logged_filename']
-                return f"https://upload.cc/{img_name}" # 這裡就是給 LINE 的網址
+                return f"https://upload.cc/{img_name}"
         return None
     except Exception as e:
         print(f"Upload.cc 上傳失敗: {e}")
         return None
-
-# 新增這段程式碼，用來應付 Render 的健康檢查
-@app.get("/")
-def read_root():
-    return {"status": "LINE Bot is running!"}
 
 # 功能 C：LINE Webhook 接收通道
 @app.post("/callback")
@@ -115,7 +108,6 @@ async def callback(request: Request):
 def handle_message(event):
     user_msg = event.message.text.strip()
     
-    # 判斷是否為股號（純數字且大於等於4碼）
     if user_msg.isdigit() and len(user_msg) >= 4:
         stock_code = user_msg
         
@@ -129,39 +121,47 @@ def handle_message(event):
                 # 2. 上傳圖床
                 img_url = upload_to_uploadcc(image_path)
                 
-                # 3. 刪除暫存圖，釋放 Render 空間
+                # 3. 刪除暫存圖
                 if os.path.exists(image_path):
                     os.remove(image_path)
                 
                 # 4. 回傳圖片給 LINE 使用者
                 if img_url:
-                    line_bot_api.reply_message_with_http_info(
-                        ReplyMessageRequest(
-                            reply_token=event.reply_token,
-                            messages=[ImageMessage(original_content_url=img_url, preview_image_url=img_url)]
+                    try:
+                        line_bot_api.reply_message_with_http_info(
+                            ReplyMessageRequest(
+                                reply_token=event.reply_token,
+                                messages=[ImageMessage(original_content_url=img_url, preview_image_url=img_url)]
+                            )
                         )
-                    )
-                    return
+                        return
+                    except Exception as line_error:
+                        print(f"❌ LINE 訊息傳送失敗: {line_error}")
+                        return
             
-            # 錯誤應答
-            line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=f"抱歉，目前無法取得股號 {stock_code} 的走勢圖。")]
+            # 失敗處理
+            try:
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=f"抱歉，目前無法取得股號 {stock_code} 的走勢圖。")]
+                    )
                 )
-            )
+            except Exception as e:
+                print(f"發送失敗通知時發生錯誤: {e}")
     else:
-        # 非股號應答
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message_with_http_info(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text="請輸入欲查詢的台灣股號（例如：2330）")]
+            try:
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text="請輸入欲查詢的台灣股號（例如：2330）")]
+                    )
                 )
-            )
+            except Exception as e:
+                print(f"發送罐頭訊息時發生錯誤: {e}")
 
 if __name__ == "__main__":
     import uvicorn
-    # 本地測試用，Render 上線時會用 Start Command 啟動
     uvicorn.run(app, host="0.0.0.0", port=8000)
